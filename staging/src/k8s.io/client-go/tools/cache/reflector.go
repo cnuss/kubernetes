@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -103,9 +104,9 @@ type Reflector struct {
 	store ReflectorStore
 	// listerWatcher is used to perform lists and watches.
 	listerWatcher ListerWatcherWithContext
-	// backoff manages backoff of ListWatch
-	backoffManager wait.BackoffManager
-	resyncPeriod   time.Duration
+	resyncPeriod  time.Duration
+	// delay returns the next backoff interval for retries.
+	delayHandler wait.DelayFunc
 	// minWatchTimeout defines the minimum timeout for watch requests.
 	minWatchTimeout time.Duration
 	// clock allows tests to manipulate time
@@ -248,6 +249,11 @@ type ReflectorOptions struct {
 
 	// Clock allows tests to control time. If unset defaults to clock.RealClock{}
 	Clock clock.Clock
+
+	// Backoff is an optional custom backoff configuration.
+	// If set, it will be used instead of the default exponential backoff.
+	// DelayWithReset(clock, resetDuration) will be called on it to create the delay function.
+	Backoff *wait.Backoff
 }
 
 // NewReflectorWithOptions creates a new Reflector object which will keep the
@@ -265,10 +271,26 @@ func NewReflectorWithOptions(lw ListerWatcher, expectedType interface{}, store R
 	if reflectorClock == nil {
 		reflectorClock = clock.RealClock{}
 	}
+
 	minWatchTimeout := defaultMinWatchTimeout
 	if options.MinWatchTimeout > defaultMinWatchTimeout {
 		minWatchTimeout = options.MinWatchTimeout
 	}
+
+	backoff := options.Backoff
+	if backoff == nil {
+		// We used to make the call every 1sec (1 QPS), the goal here is to achieve ~98% traffic reduction when
+		// API server is not healthy. With these parameters, backoff will stop at [30,60) sec interval which is
+		// 0.22 QPS.
+		backoff = &wait.Backoff{
+			Duration: 800 * time.Millisecond,
+			Cap:      30 * time.Second,
+			Steps:    int(math.Ceil(float64(30*time.Second) / float64(800*time.Millisecond))),
+			Factor:   2.0,
+			Jitter:   1.0,
+		}
+	}
+
 	r := &Reflector{
 		name:            options.Name,
 		resyncPeriod:    options.ResyncPeriod,
@@ -276,10 +298,11 @@ func NewReflectorWithOptions(lw ListerWatcher, expectedType interface{}, store R
 		typeDescription: options.TypeDescription,
 		listerWatcher:   ToListerWatcherWithContext(lw),
 		store:           store,
-		// We used to make the call every 1sec (1 QPS), the goal here is to achieve ~98% traffic reduction when
-		// API server is not healthy. With these parameters, backoff will stop at [30,60) sec interval which is
-		// 0.22 QPS. If we don't backoff for 2min, assume API server is healthy and we reset the backoff.
-		backoffManager:    wait.NewExponentialBackoffManager(800*time.Millisecond, 30*time.Second, 2*time.Minute, 2.0, 1.0, reflectorClock),
+		delayHandler: backoff.DelayWithReset(
+			reflectorClock,
+			// If we don't backoff for 2min, assume API server is healthy and we reset the backoff.
+			2*time.Minute,
+		),
 		clock:             reflectorClock,
 		watchErrorHandler: WatchErrorHandlerWithContext(DefaultWatchErrorHandler),
 		expectedType:      reflect.TypeOf(expectedType),
@@ -364,11 +387,14 @@ func (r *Reflector) Run(stopCh <-chan struct{}) {
 func (r *Reflector) RunWithContext(ctx context.Context) {
 	logger := klog.FromContext(ctx)
 	logger.V(3).Info("Starting reflector", "type", r.typeDescription, "resyncPeriod", r.resyncPeriod, "reflector", r.name)
-	wait.BackoffUntil(func() {
+	if err := r.delayHandler.Until(ctx, true /* immediate */, true /* sliding */, func(ctx context.Context) (bool, error) {
 		if err := r.ListAndWatchWithContext(ctx); err != nil {
 			r.watchErrorHandler(ctx, r, err)
 		}
-	}, r.backoffManager, true, ctx.Done())
+		return false, nil
+	}); err != nil && !errors.Is(err, context.Canceled) {
+		logger.V(2).Error(err, "Reflector stopped with error", "type", r.typeDescription, "reflector", r.name)
+	}
 	logger.V(3).Info("Stopping reflector", "type", r.typeDescription, "resyncPeriod", r.resyncPeriod, "reflector", r.name)
 }
 
@@ -547,7 +573,7 @@ func (r *Reflector) watch(ctx context.Context, w watch.Interface, resyncerrc cha
 					select {
 					case <-stopCh:
 						return nil
-					case <-r.backoffManager.Backoff().C():
+					case <-r.clock.After(r.delayHandler()):
 						continue
 					}
 				}
@@ -592,7 +618,7 @@ func (r *Reflector) watch(ctx context.Context, w watch.Interface, resyncerrc cha
 					select {
 					case <-stopCh:
 						return nil
-					case <-r.backoffManager.Backoff().C():
+					case <-r.clock.After(r.delayHandler()):
 						continue
 					}
 				case apierrors.IsInternalError(err) && retry.ShouldRetry():
@@ -746,7 +772,7 @@ func (r *Reflector) watchList(ctx context.Context) (watch.Interface, error) {
 	isErrorRetriableWithSideEffectsFn := func(err error) bool {
 		if canRetry := isWatchErrorRetriable(err); canRetry {
 			logger.V(2).Info("watch-list failed - backing off", "reflector", r.name, "type", r.typeDescription, "err", err)
-			<-r.backoffManager.Backoff().C()
+			<-r.clock.After(r.delayHandler())
 			return true
 		}
 		if isExpiredError(err) || isTooLargeResourceVersionError(err) {
