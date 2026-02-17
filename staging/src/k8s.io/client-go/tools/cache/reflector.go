@@ -662,6 +662,8 @@ func (r *Reflector) watch(ctx context.Context, w watch.Interface, resyncerrc cha
 				case apierrors.IsInternalError(err) && retry.ShouldRetry():
 					logger.V(2).Info("Retrying watch after internal error", "reflector", r.name, "type", r.typeDescription, "err", err)
 					continue
+				case errors.Is(err, context.Canceled):
+					logger.V(4).Info("Watch closed due to context cancellation", "reflector", r.name, "type", r.typeDescription)
 				default:
 					logger.Info("Warning: watch ended with error", "reflector", r.name, "type", r.typeDescription, "err", err)
 				}
