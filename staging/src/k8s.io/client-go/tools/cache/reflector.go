@@ -431,7 +431,7 @@ func (r *Reflector) RunWithContext(ctx context.Context) {
 		}
 		return false, nil
 	}); err != nil {
-		logger.Error(err, "Reflector stopped with error", "type", r.typeDescription, "reflector", r.name)
+		logger.V(4).Info("Reflector stopped with error", "err", err, "type", r.typeDescription, "reflector", r.name)
 	}
 	logger.V(3).Info("Stopping reflector", "type", r.typeDescription, "resyncPeriod", r.resyncPeriod, "reflector", r.name)
 }
